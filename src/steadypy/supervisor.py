@@ -639,7 +639,6 @@ class TaskSupervisor:
                 f"failed with {failure!r}" if failure is not None else "returned",
                 delay,
                 handle._restarts + 1,
-                exc_info=failure,
             )
             await self._clock.sleep(delay)
             handle._restarts += 1

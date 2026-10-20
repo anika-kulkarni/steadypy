@@ -1,0 +1,65 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy src
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check --strict dist/*
+
+      - name: Install the wheel in a clean environment
+        run: |
+          python -m venv /tmp/wheel-env
+          /tmp/wheel-env/bin/python -m pip install dist/*.whl
+          cd /tmp && /tmp/wheel-env/bin/python -c "import steadypy; print(steadypy.__version__)"

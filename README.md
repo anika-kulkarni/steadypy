@@ -2,6 +2,9 @@
 
 Reliable primitives for production asyncio services.
 
+[![Tests](https://github.com/anika-kulkarni/steadypy/actions/workflows/tests.yml/badge.svg)](https://github.com/anika-kulkarni/steadypy/actions/workflows/tests.yml)
+[![Quality](https://github.com/anika-kulkarni/steadypy/actions/workflows/lint.yml/badge.svg)](https://github.com/anika-kulkarni/steadypy/actions/workflows/lint.yml)
+
 asyncio has excellent concurrency primitives, but real long-running
 applications keep needing the same reliability patterns on top of them:
 

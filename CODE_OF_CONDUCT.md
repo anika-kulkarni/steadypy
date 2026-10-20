@@ -14,10 +14,10 @@ people's private information are not acceptable.
 
 ## Reporting
 
-If you experience or witness unacceptable behavior, please contact the
-project maintainer privately, using the contact details on the maintainer's
-GitHub profile. All reports will be reviewed promptly and handled
-confidentially.
+If you experience or witness unacceptable behavior, please report it
+privately by email to the project maintainer at
+[akinaspam@gmail.com](mailto:akinaspam@gmail.com). All reports will be
+reviewed promptly and handled confidentially.
 
 The maintainer will follow the
 [enforcement guidelines](https://www.contributor-covenant.org/version/2/1/code_of_conduct/#enforcement-guidelines)

@@ -301,3 +301,50 @@ async def test_stream_must_be_used_as_a_context_manager() -> None:
     with pytest.raises(RuntimeError, match="only be entered once"):
         async with stream:
             pass
+
+
+# -- cancellation during cleanup and composition -------------------------------
+
+
+async def test_cleanup_finishes_even_if_the_caller_is_cancelled_again() -> None:
+    release_cleanup = asyncio.Event()
+    finished_cleanup: list[int] = []
+
+    async def slow_to_cancel(item: int) -> int:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_cleanup.wait()  # e.g. flushing a buffer
+            finished_cleanup.append(item)
+            raise
+        return item  # pragma: no cover
+
+    task = asyncio.create_task(bounded_map(slow_to_cancel, range(2), concurrency=2))
+    await settle()
+    task.cancel()
+    await settle()
+    task.cancel()  # an impatient second cancellation
+    await settle()
+    assert not task.done()  # still waiting for the calls to finish cleaning up
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sorted(finished_cleanup) == [0, 1]
+
+
+async def test_stopping_a_supervisor_cancels_bounded_work_inside_it() -> None:
+    from steadypy import TaskSupervisor
+
+    tracker = Tracker()
+
+    async def batch_job() -> list[int]:
+        return await bounded_map(tracker, range(100), concurrency=5)
+
+    async with TaskSupervisor() as supervisor:
+        handle = supervisor.start(batch_job)
+        await settle()
+        assert tracker.active == 5
+        supervisor.stop()
+    assert handle.done()
+    assert sorted(tracker.cancelled) == [0, 1, 2, 3, 4]
+    assert tracker.active == 0

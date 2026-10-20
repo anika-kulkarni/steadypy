@@ -527,6 +527,178 @@ async def test_restarts_are_logged(clock: FakeClock, caplog: pytest.LogCaptureFi
     assert any("restart limit" in m for m in messages)
 
 
+# -- cancellation edge cases --------------------------------------------------
+
+
+async def test_parent_cancelled_while_the_exit_waits_for_children() -> None:
+    cleaned_up = asyncio.Event()
+    in_exit = asyncio.Event()
+
+    async def child() -> None:
+        try:
+            await forever()
+        finally:
+            await asyncio.sleep(0)
+            cleaned_up.set()
+
+    async def service() -> None:
+        async with TaskSupervisor() as supervisor:
+            supervisor.start(child)
+            in_exit.set()  # the body ends here; __aexit__ now waits for the child
+
+    task = asyncio.create_task(service())
+    await in_exit.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned_up.is_set()
+
+
+async def test_swallowed_cancellation_is_never_restarted() -> None:
+    inner: list[asyncio.Task[object]] = []
+    runs = 0
+
+    async def stubborn() -> None:
+        nonlocal runs
+        runs += 1
+        task = asyncio.current_task()
+        assert task is not None
+        inner.append(task)
+        try:
+            await forever()
+        except asyncio.CancelledError:
+            return  # bad practice, but it happens
+
+    async with TaskSupervisor() as supervisor:
+        handle = supervisor.start(stubborn, restart="always")
+        await asyncio.sleep(0)
+        inner[0].cancel()  # cancel the asyncio task directly, not via the handle
+        await handle.wait()
+    assert runs == 1
+    assert handle.state is TaskState.COMPLETED
+
+
+async def test_a_child_raising_cancelled_error_itself_is_not_an_error() -> None:
+    async def gives_up() -> None:
+        await asyncio.sleep(0)
+        raise asyncio.CancelledError
+
+    async with TaskSupervisor() as supervisor:
+        handle = supervisor.start(gives_up, restart=True)
+        other = supervisor.start(returns, 1)
+    assert handle.state is TaskState.CANCELLED
+    assert other.result() == 1
+    assert supervisor.errors == ()
+
+
+async def test_parent_cancelled_during_a_restart_backoff(clock: FakeClock) -> None:
+    async def service() -> None:
+        async with TaskSupervisor(clock=clock, restart_delay=3_600) as supervisor:
+            supervisor.start(fails, restart=True)
+            await forever()
+
+    task = asyncio.create_task(service())
+    await clock.advance(1)
+    assert clock.pending_sleeps == 1  # the child is waiting out its backoff
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert clock.pending_sleeps == 0
+
+
+async def test_cancelling_a_handle_during_its_backoff(clock: FakeClock) -> None:
+    async with TaskSupervisor(clock=clock, restart_delay=10) as supervisor:
+        handle = supervisor.start(fails, restart=True)
+        await clock.advance(1)
+        assert handle.state is TaskState.RESTARTING
+        handle.cancel()
+        await handle.wait()
+        assert handle.state is TaskState.CANCELLED
+    assert (handle.failures, handle.restarts) == (1, 0)
+    assert supervisor.errors == ()
+
+
+async def test_works_inside_asyncio_timeout() -> None:
+    cancelled = asyncio.Event()
+
+    async def child() -> None:
+        try:
+            await forever()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0), TaskSupervisor() as supervisor:
+            supervisor.start(child)
+            await forever()
+    assert cancelled.is_set()
+
+
+async def test_fail_fast_inside_an_unexpired_timeout_raises_the_failure() -> None:
+    # The supervisor's own cancellation of the body must not be mistaken for
+    # the timeout expiring, nor leave a stray cancellation request behind.
+    with pytest.raises(ExceptionGroup):
+        async with asyncio.timeout(3_600), TaskSupervisor() as supervisor:
+            supervisor.start(fails)
+            await forever()
+    current = asyncio.current_task()
+    assert current is not None
+    assert current.cancelling() == 0
+    await asyncio.sleep(0)  # and the task is still usable
+
+
+# -- dynamic tasks, zero delays and introspection ------------------------------
+
+
+async def test_children_can_start_siblings_while_the_exit_waits() -> None:
+    results: list[str] = []
+
+    async def spawner(supervisor: TaskSupervisor) -> None:
+        await asyncio.sleep(0)
+        supervisor.start(late_child, name="late")
+
+    async def late_child() -> None:
+        await asyncio.sleep(0)
+        results.append("late child ran")
+
+    async with TaskSupervisor() as supervisor:
+        supervisor.start(spawner, supervisor)
+    assert results == ["late child ran"]
+    assert supervisor.tasks["late"].state is TaskState.COMPLETED
+
+
+async def test_zero_restart_delay_restarts_immediately(clock: FakeClock) -> None:
+    runs = 0
+
+    async def flaky() -> None:
+        nonlocal runs
+        runs += 1
+        if runs < 4:
+            raise Boom
+
+    async with TaskSupervisor(clock=clock, restart_delay=0) as supervisor:
+        handle = supervisor.start(flaky, restart=True)
+    assert runs == 4
+    assert handle.restarts == 3
+    assert clock.monotonic() == 0
+
+
+async def test_introspection_strings() -> None:
+    supervisor = TaskSupervisor(name="ingest")
+    assert repr(supervisor) == "<TaskSupervisor 'ingest' new tasks=0 errors=0>"
+    async with supervisor:
+        handle = supervisor.start(forever, name="loop", restart="always")
+        assert supervisor.name == "ingest"
+        assert handle.restart_mode == "always"
+        assert repr(supervisor) == "<TaskSupervisor 'ingest' running tasks=1 errors=0>"
+        assert repr(handle) == "<SupervisedTask 'loop' state=running restarts=0 failures=0>"
+        supervisor.stop()
+        assert "stopping" in repr(supervisor)
+    assert repr(supervisor) == "<TaskSupervisor 'ingest' closed tasks=0 errors=0>"
+
+
 async def test_max_restart_delay_defaults_to_at_least_the_restart_delay(clock: FakeClock) -> None:
     starts: dict[str, list[float]] = {"a": [], "b": []}
 

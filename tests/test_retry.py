@@ -350,6 +350,26 @@ async def test_partial_binds_arguments(clock: FakeClock) -> None:
     assert await retry(functools.partial(add, 2, 3), clock=clock) == 5
 
 
+async def test_huge_backoff_exponents_saturate_at_max_delay(clock: FakeClock) -> None:
+    seen: list[RetryAttempt] = []
+    await run_with_clock(
+        clock,
+        retry(
+            Flaky(60),
+            attempts=61,
+            base_delay=1,
+            max_delay=2,
+            multiplier=1e10,  # 1e10 ** 40 overflows a float
+            jitter=0,
+            on_retry=seen.append,
+            clock=clock,
+        ),
+        advance=1_000,
+    )
+    assert seen[0].delay == 1
+    assert {a.delay for a in seen[1:]} == {2}
+
+
 async def test_max_delay_defaults_to_at_least_the_base_delay(clock: FakeClock) -> None:
     seen: list[RetryAttempt] = []
     await run_with_clock(

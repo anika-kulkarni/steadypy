@@ -13,6 +13,7 @@ async def test_system_clock_is_monotonic_and_sleeps() -> None:
     before = clock.monotonic()
     await clock.sleep(0)
     assert clock.monotonic() >= before
+    assert repr(clock) == "SystemClock()"
 
 
 async def test_fake_clock_only_moves_when_advanced(clock: FakeClock) -> None:

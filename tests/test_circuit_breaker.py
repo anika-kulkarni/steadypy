@@ -165,7 +165,9 @@ async def test_state_change_callback_sees_every_transition(
 
 
 async def test_repr_shows_name_and_state(clock: FakeClock) -> None:
-    assert "'api' state=closed" in repr(CircuitBreaker(name="api", clock=clock))
+    breaker = CircuitBreaker(name="api", clock=clock)
+    assert breaker.name == "api"
+    assert "'api' state=closed" in repr(breaker)
 
 
 @pytest.mark.parametrize(

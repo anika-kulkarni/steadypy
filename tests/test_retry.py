@@ -376,3 +376,16 @@ async def test_max_delay_defaults_to_at_least_the_base_delay(clock: FakeClock) -
         clock, retry(Flaky(2), base_delay=30, jitter=0, on_retry=seen.append, clock=clock)
     )
     assert [a.delay for a in seen] == [30, 30]
+
+
+async def test_a_function_that_returns_no_awaitable_is_not_retried(clock: FakeClock) -> None:
+    calls = 0
+
+    def charge_card() -> str:  # forgot to make it async
+        nonlocal calls
+        calls += 1
+        return "charged"
+
+    with pytest.raises(TypeError, match="returned str, not an awaitable"):
+        await retry(charge_card, attempts=5, clock=clock)  # type: ignore[arg-type]
+    assert calls == 1

@@ -21,7 +21,7 @@ import logging
 import random
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, ParamSpec, Protocol, TypeVar, overload
+from typing import Any, ParamSpec, Protocol, TypeVar, cast, overload
 
 from steadypy._backoff import exponential_delay
 from steadypy.clock import Clock, resolve_clock
@@ -222,7 +222,9 @@ async def _retry(func: Callable[[], Awaitable[T]], policy: _Policy) -> T:
         attempt += 1
         cancel_requests = task.cancelling() if task is not None else 0
         try:
-            return await func()
+            outcome: object = func()
+            if inspect.isawaitable(outcome):
+                return await cast(Awaitable[T], outcome)
         except policy.retry_on as exc:
             if task is not None and task.cancelling() > cancel_requests:
                 # The task was asked to cancel during this attempt and the
@@ -252,6 +254,13 @@ async def _retry(func: Callable[[], Awaitable[T]], policy: _Policy) -> T:
                 getattr(func, "__qualname__", func),
                 exc,
                 delay,
+            )
+        else:
+            # Not retried: a function that is not async will never become one.
+            raise TypeError(
+                f"{getattr(func, '__qualname__', func)!s} returned "
+                f"{type(outcome).__name__}, not an awaitable; retry() needs an async "
+                "function or a callable that returns an awaitable"
             )
         # Sleep outside the except block so the failed attempt's exception is
         # not kept alive as the context of anything raised while waiting.

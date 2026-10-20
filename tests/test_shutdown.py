@@ -126,3 +126,24 @@ async def test_falls_back_to_signal_module_without_loop_support(
 async def test_installing_off_the_main_thread_is_refused(shutdown: ShutdownSignal) -> None:
     with pytest.raises(RuntimeError, match="main thread"):
         await asyncio.to_thread(shutdown.install_signal_handlers)
+
+
+@unix_only
+async def test_refuses_to_replace_an_event_loop_signal_handler(shutdown: ShutdownSignal) -> None:
+    loop = asyncio.get_running_loop()
+    calls: list[str] = []
+    loop.add_signal_handler(signal.SIGUSR1, calls.append, "application handler")
+    try:
+        with pytest.raises(RuntimeError, match="SIGUSR1 already handled"):
+            shutdown.install_signal_handlers([signal.SIGUSR2, signal.SIGUSR1])
+        assert shutdown.install_signal_handlers([signal.SIGUSR2]) == (signal.SIGUSR2,)
+        os.kill(os.getpid(), signal.SIGUSR1)  # the application's handler still works
+        async with asyncio.timeout(5):
+            while not calls:
+                await asyncio.sleep(0)
+        assert calls == ["application handler"]
+        # A second ShutdownSignal cannot take over the first one's signal either.
+        with pytest.raises(RuntimeError, match="SIGUSR2 already handled"):
+            ShutdownSignal().install_signal_handlers([signal.SIGUSR2])
+    finally:
+        loop.remove_signal_handler(signal.SIGUSR1)

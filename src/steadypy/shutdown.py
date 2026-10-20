@@ -96,18 +96,35 @@ class ShutdownSignal:
         thread while the event loop is running. Signals that already have a
         handler from this object are skipped.
 
+        A handler set with :func:`signal.signal` is replaced and restored by
+        :meth:`remove_signal_handlers`. A handler registered with
+        ``loop.add_signal_handler()`` cannot be restored once replaced, so
+        installing over one is refused instead. That includes another
+        ``ShutdownSignal``'s handlers: an event loop allows one handler per
+        signal.
+
         Returns:
             The signals for which a handler was installed by this call.
+
+        Raises:
+            RuntimeError: If called off the main thread, or if one of the
+                signals already has a handler registered with the event loop.
+                Nothing is installed in that case.
         """
         if threading.current_thread() is not threading.main_thread():
             raise RuntimeError("signal handlers can only be installed from the main thread")
         loop = asyncio.get_running_loop()
         chosen = (signal.SIGINT, signal.SIGTERM) if signals is None else signals
+        wanted = [s for s in dict.fromkeys(map(signal.Signals, chosen)) if s not in self._installed]
+        taken = [s.name for s in wanted if _owned_by_event_loop(signal.getsignal(s))]
+        if taken:
+            raise RuntimeError(
+                f"{', '.join(taken)} already handled via loop.add_signal_handler(); "
+                "installing would replace that handler for good. Remove it first, or "
+                "call this ShutdownSignal's trigger() from it."
+            )
         installed: list[signal.Signals] = []
-        for value in chosen:
-            sig = signal.Signals(value)
-            if sig in self._installed:
-                continue
+        for sig in wanted:
             previous = signal.getsignal(sig)
             try:
                 loop.add_signal_handler(sig, self._on_signal, sig)
@@ -120,7 +137,10 @@ class ShutdownSignal:
         return tuple(installed)
 
     def remove_signal_handlers(self) -> None:
-        """Remove the handlers installed by this object and restore the previous ones."""
+        """Remove the handlers installed by this object and restore the previous ones.
+
+        Calling it again, or when nothing is installed, does nothing.
+        """
         while self._installed:
             sig, entry = self._installed.popitem()
             if entry.via_loop and not entry.loop.is_closed():
@@ -142,3 +162,14 @@ class ShutdownSignal:
         # busy: hand the work to the loop instead of touching state here.
         if not loop.is_closed():
             loop.call_soon_threadsafe(self._on_signal, signal.Signals(signum))
+
+
+def _owned_by_event_loop(handler: object) -> bool:
+    """Whether ``handler`` is the placeholder that ``loop.add_signal_handler()`` installs.
+
+    The event loop keeps the real callback to itself, so it can be neither
+    read back nor restored once replaced.
+    """
+    return getattr(handler, "__name__", None) == "_sighandler_noop" and str(
+        getattr(handler, "__module__", "")
+    ).startswith("asyncio")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import sys
 import weakref
 from itertools import pairwise
 
@@ -756,6 +757,7 @@ async def test_max_restart_delay_defaults_to_at_least_the_restart_delay(clock: F
 # -- review fixes: lost cancellations, base errors, memory ------------------------
 
 
+@pytest.mark.skipif(sys.version_info < (3, 13), reason="re-armed only where uncancel() is safe")
 async def test_external_cancellation_survives_failures_raised_at_exit() -> None:
     entered = asyncio.Event()
     after_group: list[str] = []
@@ -783,6 +785,23 @@ async def test_external_cancellation_survives_failures_raised_at_exit() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert after_group == ["handled the group"]
+
+
+async def test_failures_inside_an_expired_timeout_leave_no_stray_cancellation() -> None:
+    async def fails_during_cleanup() -> None:
+        try:
+            await forever()
+        finally:
+            raise Boom("cleanup failed")
+
+    with pytest.raises(ExceptionGroup):
+        async with asyncio.timeout(0), TaskSupervisor(fail_fast=False) as supervisor:
+            supervisor.start(fails_during_cleanup)
+            await forever()
+    current = asyncio.current_task()
+    assert current is not None
+    assert current.cancelling() == 0
+    await asyncio.sleep(0)  # must not raise a stray CancelledError
 
 
 async def test_base_exception_from_the_body_is_never_wrapped() -> None:

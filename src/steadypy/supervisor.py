@@ -23,6 +23,7 @@ import enum
 import functools
 import inspect
 import logging
+import sys
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from types import MappingProxyType, TracebackType
@@ -39,6 +40,13 @@ T = TypeVar("T")
 Ts = TypeVarTuple("Ts")
 
 _DEFAULT_MAX_RESTART_DELAY = 30.0
+
+# Re-arming a pending cancellation (uncancel() + cancel()) is only safe from
+# Python 3.13, where uncancel() also clears the cancellation once no requests
+# remain. On 3.11 and 3.12 the re-armed request would survive an enclosing
+# asyncio.timeout() withdrawing it, and hit the next await as a stray
+# CancelledError. There, as TaskGroup does, the pending request is absorbed.
+_REARM_PENDING_CANCELLATION = sys.version_info >= (3, 13)
 
 RestartMode = Literal["never", "on-failure", "always"]
 """When a supervised task is restarted.
@@ -311,8 +319,9 @@ class TaskSupervisor:
 
         As with :class:`asyncio.TaskGroup`, failures take priority: if tasks
         failed, the ``ExceptionGroup`` is raised instead of ``CancelledError``.
-        The cancellation request is kept pending (as Python 3.13's
-        ``TaskGroup`` does), so it is delivered at the next ``await``.
+        On Python 3.13 and later the cancellation request is kept pending, as
+        ``TaskGroup`` does there, so it is delivered at the next ``await``. On
+        3.11 and 3.12 it is absorbed, again matching ``TaskGroup``.
 
         A task that ends with a ``CancelledError`` although nobody cancelled
         it (it awaited a future that something else cancelled) counts as a
@@ -426,10 +435,10 @@ class TaskSupervisor:
                 raise propagate_cancel
             return  # any other exception from the body propagates unchanged
 
-        if parent.cancelling():
+        if _REARM_PENDING_CANCELLATION and parent.cancelling():
             # Failures take priority over a pending cancellation, but the
             # cancellation must not be lost: re-arm it so that it is delivered
-            # at the parent's next await (what TaskGroup does since 3.13).
+            # at the parent's next await, as TaskGroup does since 3.13.
             parent.uncancel()
             parent.cancel()
         if self._base_error is not None:

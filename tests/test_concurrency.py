@@ -348,3 +348,78 @@ async def test_stopping_a_supervisor_cancels_bounded_work_inside_it() -> None:
     assert handle.done()
     assert sorted(tracker.cancelled) == [0, 1, 2, 3, 4]
     assert tracker.active == 0
+
+
+# -- slow or interactive async inputs ----------------------------------------------
+
+
+async def test_a_slow_async_input_does_not_hold_back_finished_results() -> None:
+    release_rest = asyncio.Event()
+
+    async def source() -> AsyncIterator[int]:
+        yield 0
+        await release_rest.wait()  # the input stalls after its first item
+        yield 1
+
+    seen: list[int] = []
+
+    async def consume() -> None:
+        async with bounded_stream(double, source(), concurrency=4) as results:
+            async for result in results:
+                seen.append(result)
+
+    task = asyncio.create_task(consume())
+    await settle()
+    assert seen == [0]  # delivered while the input is still stalled
+    release_rest.set()
+    await task
+    assert seen == [0, 2]
+
+
+async def test_results_can_feed_the_input_without_deadlock() -> None:
+    queue: asyncio.Queue[int | None] = asyncio.Queue()
+    await queue.put(1)
+
+    async def frontier() -> AsyncIterator[int]:  # e.g. URLs discovered while crawling
+        while (item := await queue.get()) is not None:
+            yield item
+
+    seen: list[int] = []
+    async with asyncio.timeout(5):  # fail rather than hang if this regresses
+        async with bounded_stream(double, frontier(), concurrency=3, ordered=False) as results:
+            async for result in results:
+                seen.append(result)
+                await queue.put(result if result < 16 else None)
+    assert seen == [2, 4, 8, 16]
+
+
+async def test_a_consumer_timeout_does_not_truncate_the_stream() -> None:
+    gates = [asyncio.Event() for _ in range(3)]
+
+    async def source() -> AsyncIterator[int]:
+        for n, gate in enumerate(gates):
+            await gate.wait()
+            yield n
+
+    async with bounded_stream(double, source(), concurrency=2) as results:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0):
+                await anext(results)  # nothing is ready yet
+        for gate in gates:
+            gate.set()
+        assert [r async for r in results] == [0, 2, 4]
+
+
+async def test_errors_from_an_async_input_propagate_after_cleanup() -> None:
+    tracker = Tracker()
+
+    async def source() -> AsyncIterator[int]:
+        yield 0
+        yield 1
+        raise RuntimeError("feed broke")
+
+    task = asyncio.create_task(bounded_map(tracker, source(), concurrency=5))
+    with pytest.raises(RuntimeError, match="feed broke"):
+        await task
+    assert sorted(tracker.cancelled) == [0, 1]
+    assert tracker.active == 0

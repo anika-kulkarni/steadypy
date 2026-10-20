@@ -27,8 +27,17 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 
+_EXHAUSTED: Any = object()
+
+
 class _Runner(Generic[T, R]):
-    """Pulls items lazily and keeps at most ``concurrency`` calls in flight."""
+    """Pulls items lazily and keeps at most ``concurrency`` calls in flight.
+
+    An async input is read by a separate *pull* task, one item at a time,
+    which is waited on together with the calls in flight. A slow input
+    therefore never holds back results that are already available, and a
+    cancelled consumer never interrupts the input in the middle of an item.
+    """
 
     def __init__(
         self,
@@ -54,54 +63,90 @@ class _Runner(Generic[T, R]):
         self._next_index = 0
         self._next_to_yield = 0
         self._in_flight: dict[asyncio.Task[R], int] = {}
+        self._pull: asyncio.Task[Any] | None = None
 
     async def next(self, *, ordered: bool) -> tuple[int, asyncio.Task[R]] | None:
         """Return the next finished task and its input index, or ``None`` at the end."""
-        await self._fill()
-        if not self._in_flight:
-            return None
-        if ordered:
-            task = next(t for t, i in self._in_flight.items() if i == self._next_to_yield)
-            if not task.done():
-                await asyncio.wait({task})
-        else:
-            finished = [t for t in self._in_flight if t.done()]
-            if not finished:
-                done, _ = await asyncio.wait(self._in_flight, return_when=asyncio.FIRST_COMPLETED)
-                finished = list(done)
-            # Several tasks may finish in the same loop iteration; prefer input
-            # order among them so results are deterministic.
-            task = min(finished, key=self._in_flight.__getitem__)
-        index = self._in_flight.pop(task)
-        if ordered:
-            self._next_to_yield += 1
-        return index, task
+        while True:
+            self._collect_pull()
+            self._fill()
+            task = self._ready(ordered)
+            if task is not None:
+                index = self._in_flight.pop(task)
+                if ordered:
+                    self._next_to_yield += 1
+                return index, task
+            if not self._in_flight and self._pull is None:
+                return None
+            waiting: set[asyncio.Future[Any]] = set()
+            if ordered and self._in_flight:
+                waiting.add(self._head())
+            elif not ordered:
+                waiting.update(self._in_flight)
+            if self._pull is not None:
+                waiting.add(self._pull)
+            await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
 
     async def aclose(self) -> None:
         """Stop pulling items; cancel and await every call still in flight."""
         self._exhausted = True
-        tasks = list(self._in_flight)
+        tasks: list[asyncio.Task[Any]] = list(self._in_flight)
         self._in_flight.clear()
+        if self._pull is not None:
+            tasks.append(self._pull)
+            self._pull = None
         await _cancel_and_wait(tasks)
 
-    async def _fill(self) -> None:
+    def _head(self) -> asyncio.Task[R]:
+        return next(t for t, i in self._in_flight.items() if i == self._next_to_yield)
+
+    def _ready(self, ordered: bool) -> asyncio.Task[R] | None:
+        if not self._in_flight:
+            return None
+        if ordered:
+            head = self._head()
+            return head if head.done() else None
+        finished = [t for t in self._in_flight if t.done()]
+        # Several tasks may finish in the same loop iteration; prefer input
+        # order among them so results are deterministic.
+        return min(finished, key=self._in_flight.__getitem__) if finished else None
+
+    def _fill(self) -> None:
         while not self._exhausted and len(self._in_flight) < self._concurrency:
             if self._async_items is not None:
-                try:
-                    item = await anext(self._async_items)
-                except StopAsyncIteration:
-                    self._exhausted = True
-                    return
-            else:
-                assert self._sync_items is not None
-                try:
-                    item = next(self._sync_items)
-                except StopIteration:
-                    self._exhausted = True
-                    return
-            task = asyncio.create_task(self._call(item))
-            self._in_flight[task] = self._next_index
-            self._next_index += 1
+                if self._pull is None:
+                    self._pull = asyncio.create_task(self._pull_next(self._async_items))
+                return  # the pull task delivers the next item when it is ready
+            assert self._sync_items is not None
+            try:
+                item = next(self._sync_items)
+            except StopIteration:
+                self._exhausted = True
+                return
+            self._start(item)
+
+    def _collect_pull(self) -> None:
+        pull = self._pull
+        if pull is None or not pull.done():
+            return
+        self._pull = None
+        item = pull.result()  # an error from the input propagates from here
+        if item is _EXHAUSTED:
+            self._exhausted = True
+        else:
+            self._start(item)
+
+    def _start(self, item: T) -> None:
+        task = asyncio.create_task(self._call(item))
+        self._in_flight[task] = self._next_index
+        self._next_index += 1
+
+    @staticmethod
+    async def _pull_next(items: AsyncIterator[T]) -> Any:
+        try:
+            return await anext(items)
+        except StopAsyncIteration:
+            return _EXHAUSTED
 
     async def _call(self, item: T) -> R:
         return await self._func(item)

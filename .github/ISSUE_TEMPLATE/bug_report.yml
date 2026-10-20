@@ -1,0 +1,50 @@
+name: Bug report
+description: steadypy behaves differently from its documentation.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. For security problems, please
+        follow SECURITY.md instead of opening a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: >
+        A short, self-contained script that shows the problem. If timing
+        matters, steadypy.testing.FakeClock can often make it deterministic.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or traceback
+      render: text
+  - type: input
+    id: steadypy-version
+    attributes:
+      label: steadypy version or commit
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and event loop
+      placeholder: "Ubuntu 24.04, default asyncio loop"

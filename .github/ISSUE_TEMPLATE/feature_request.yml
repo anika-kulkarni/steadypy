@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest an improvement or a new primitive.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        steadypy tries to stay small, so the most helpful requests start from a
+        concrete problem in a real service.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and why is it hard with steadypy or asyncio today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API or behavior
+      description: A sketch of how you would like to use it.
+      render: python
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use now, or other libraries that solve this.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I would be willing to open a pull request for this.

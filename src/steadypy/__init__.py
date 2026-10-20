@@ -6,13 +6,18 @@ import logging
 
 from steadypy.clock import Clock, SystemClock
 from steadypy.exceptions import SteadyError
+from steadypy.supervisor import RestartMode, SupervisedTask, TaskState, TaskSupervisor
 
 __version__ = "0.1.0"
 
 __all__ = [
     "Clock",
+    "RestartMode",
     "SteadyError",
+    "SupervisedTask",
     "SystemClock",
+    "TaskState",
+    "TaskSupervisor",
     "__version__",
 ]
 

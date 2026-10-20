@@ -35,6 +35,8 @@ P = ParamSpec("P")
 
 ExceptionTypes = type[Exception] | tuple[type[Exception], ...]
 
+_DEFAULT_MAX_DELAY = 10.0
+
 
 @dataclass(frozen=True, slots=True)
 class RetryAttempt:
@@ -72,7 +74,7 @@ class _Policy:
         *,
         attempts: int,
         base_delay: float,
-        max_delay: float,
+        max_delay: float | None,
         multiplier: float,
         jitter: float,
         retry_on: ExceptionTypes,
@@ -85,7 +87,9 @@ class _Policy:
             raise ValueError("attempts must be an integer >= 1")
         if base_delay < 0:
             raise ValueError("base_delay must be >= 0")
-        if max_delay < base_delay:
+        if max_delay is None:
+            max_delay = max(_DEFAULT_MAX_DELAY, base_delay)
+        elif max_delay < base_delay:
             raise ValueError("max_delay must be >= base_delay")
         if multiplier < 1:
             raise ValueError("multiplier must be >= 1")
@@ -127,7 +131,7 @@ async def retry(
     *,
     attempts: int = 3,
     base_delay: float = 0.1,
-    max_delay: float = 10.0,
+    max_delay: float | None = None,
     multiplier: float = 2.0,
     jitter: float = 1.0,
     retry_on: ExceptionTypes = Exception,
@@ -152,7 +156,8 @@ async def retry(
             since a coroutine can only be awaited once.
         attempts: Maximum number of attempts, including the first.
         base_delay: Delay before the first retry, in seconds.
-        max_delay: Upper bound for any delay.
+        max_delay: Upper bound for any delay. Defaults to 10 seconds, or to
+            ``base_delay`` if that is larger.
         multiplier: Growth factor between consecutive delays.
         jitter: Fraction of each delay that is randomized, between 0 and 1.
             The actual delay is drawn uniformly from
@@ -272,7 +277,7 @@ def async_retry(
     *,
     attempts: int = 3,
     base_delay: float = 0.1,
-    max_delay: float = 10.0,
+    max_delay: float | None = None,
     multiplier: float = 2.0,
     jitter: float = 1.0,
     retry_on: ExceptionTypes = Exception,
@@ -289,7 +294,7 @@ def async_retry(
     *,
     attempts: int = 3,
     base_delay: float = 0.1,
-    max_delay: float = 10.0,
+    max_delay: float | None = None,
     multiplier: float = 2.0,
     jitter: float = 1.0,
     retry_on: ExceptionTypes = Exception,

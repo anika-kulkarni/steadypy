@@ -525,3 +525,19 @@ async def test_restarts_are_logged(clock: FakeClock, caplog: pytest.LogCaptureFi
     messages = [r.getMessage() for r in caplog.records]
     assert any("'flaky'" in m and "restarting in 1s" in m for m in messages)
     assert any("restart limit" in m for m in messages)
+
+
+async def test_max_restart_delay_defaults_to_at_least_the_restart_delay(clock: FakeClock) -> None:
+    starts: dict[str, list[float]] = {"a": [], "b": []}
+
+    async def always_fails(label: str) -> None:
+        starts[label].append(clock.monotonic())
+        raise Boom
+
+    with pytest.raises(ExceptionGroup):
+        async with TaskSupervisor(clock=clock, restart_delay=60, fail_fast=False) as supervisor:
+            supervisor.start(always_fails, "a", restart=True, max_restarts=2)
+            supervisor.start(always_fails, "b", restart=True, max_restarts=1, restart_delay=100)
+            await clock.advance(1_000)
+    assert starts["a"] == [0, 60, 120]  # capped at 60, not doubled to 120
+    assert starts["b"] == [0, 100]

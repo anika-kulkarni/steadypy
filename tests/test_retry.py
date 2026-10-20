@@ -348,3 +348,11 @@ async def test_partial_binds_arguments(clock: FakeClock) -> None:
         return a + b
 
     assert await retry(functools.partial(add, 2, 3), clock=clock) == 5
+
+
+async def test_max_delay_defaults_to_at_least_the_base_delay(clock: FakeClock) -> None:
+    seen: list[RetryAttempt] = []
+    await run_with_clock(
+        clock, retry(Flaky(2), base_delay=30, jitter=0, on_retry=seen.append, clock=clock)
+    )
+    assert [a.delay for a in seen] == [30, 30]

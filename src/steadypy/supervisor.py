@@ -38,6 +38,8 @@ logger = logging.getLogger("steadypy.supervisor")
 T = TypeVar("T")
 Ts = TypeVarTuple("Ts")
 
+_DEFAULT_MAX_RESTART_DELAY = 30.0
+
 RestartMode = Literal["never", "on-failure", "always"]
 """When a supervised task is restarted.
 
@@ -289,7 +291,8 @@ class TaskSupervisor:
         fail_fast: Whether one task failing for good cancels everything else.
         restart_delay: Default delay before a task's first restart. Each
             further restart doubles it.
-        max_restart_delay: Upper bound for the restart delay.
+        max_restart_delay: Upper bound for the restart delay. Defaults to 30
+            seconds, or to ``restart_delay`` if that is larger.
         name: Optional name for log messages and ``repr``.
         clock: Time source for restart backoff; see :mod:`steadypy.testing`.
     """
@@ -299,10 +302,12 @@ class TaskSupervisor:
         *,
         fail_fast: bool = True,
         restart_delay: float = 0.5,
-        max_restart_delay: float = 30.0,
+        max_restart_delay: float | None = None,
         name: str | None = None,
         clock: Clock | None = None,
     ) -> None:
+        if max_restart_delay is None:
+            max_restart_delay = max(_DEFAULT_MAX_RESTART_DELAY, restart_delay)
         _check_delays(restart_delay, max_restart_delay)
         self._fail_fast = fail_fast
         self._restart_delay = restart_delay
@@ -442,6 +447,8 @@ class TaskSupervisor:
                 a while starts again from the shortest delay.
             restart_delay: Overrides the supervisor's ``restart_delay``.
             max_restart_delay: Overrides the supervisor's ``max_restart_delay``.
+                When only ``restart_delay`` is overridden, the cap is raised to
+                it if necessary.
 
         Raises:
             RuntimeError: If the supervisor is not entered, is stopping, or has
@@ -464,7 +471,10 @@ class TaskSupervisor:
             if restart_window is not None and restart_window <= 0:
                 raise ValueError("restart_window must be > 0 or None")
             delay = self._restart_delay if restart_delay is None else restart_delay
-            max_delay = self._max_restart_delay if max_restart_delay is None else max_restart_delay
+            if max_restart_delay is None:
+                max_delay = max(self._max_restart_delay, delay)
+            else:
+                max_delay = max_restart_delay
             _check_delays(delay, max_delay)
 
             factory: Callable[[], Awaitable[Any]]

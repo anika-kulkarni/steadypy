@@ -23,10 +23,12 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, ParamSpec, Self, TypeVar
+from typing import ParamSpec, Self, TypeVar
 
 from steadypy.clock import Clock, resolve_clock
 from steadypy.exceptions import CircuitOpenError
@@ -71,12 +73,40 @@ class CircuitStats:
     rejections: int
 
 
-@dataclass(slots=True)
+@dataclass(eq=False, slots=True)
 class _Ticket:
     """An admitted call: the state generation it was admitted in."""
 
     generation: int
     probe: bool
+    admitted_at: float
+
+
+class _Guard:
+    """One protected call: admitted on entry, its outcome recorded on exit."""
+
+    __slots__ = ("_breaker", "_entered", "_ticket")
+
+    def __init__(self, breaker: CircuitBreaker) -> None:
+        self._breaker = breaker
+        self._entered = False
+        self._ticket: _Ticket | None = None
+
+    async def __aenter__(self) -> None:
+        if self._entered:
+            raise RuntimeError("a CircuitBreaker.guard() can only be used once")
+        self._entered = True
+        self._ticket = self._breaker._admit()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        ticket, self._ticket = self._ticket, None
+        if ticket is not None:
+            self._breaker._record(ticket, exc)
 
 
 class CircuitBreaker:
@@ -84,7 +114,9 @@ class CircuitBreaker:
 
     Use it as an async context manager around the protected call, or call
     :meth:`call`. One breaker is meant to be shared by every caller of the
-    same dependency.
+    same dependency. ``async with breaker:`` must be entered and exited in
+    the same task; where that is not guaranteed (for example around a
+    ``yield`` in an async generator), use ``async with breaker.guard():``.
 
     How outcomes are counted:
         * An exception matching ``failure_exceptions`` is a **failure**.
@@ -93,7 +125,16 @@ class CircuitBreaker:
           rejected the response. The exception still propagates.
         * :class:`asyncio.CancelledError` (and other non-``Exception``
           ``BaseException`` types) are **neutral**: they change no counters and
-          no state, but a cancelled probe does free its half-open slot.
+          no state, but a cancelled probe does free its half-open slot. This
+          means a timeout placed *outside* the breaker never counts as a
+          failure; put ``asyncio.timeout()`` inside the protected block so a
+          hanging dependency raises :class:`TimeoutError` there.
+
+    Probe calls:
+        While half-open, at most ``half_open_max_calls`` probes run at once.
+        A probe that has not reported back within ``recovery_timeout`` seconds
+        is considered lost and its slot is given to the next caller, so a
+        probe that hangs cannot keep the circuit half-open forever.
 
     Concurrency:
         State transitions happen synchronously between ``await`` points, so a
@@ -154,11 +195,15 @@ class CircuitBreaker:
         self._generation = 0
         self._consecutive_failures = 0
         self._opened_at = 0.0
-        self._probes_in_flight = 0
+        self._probes: set[_Ticket] = set()
         self._successes = 0
         self._failures = 0
         self._rejections = 0
-        self._tickets: dict[asyncio.Task[Any] | None, list[_Ticket]] = {}
+        # Guards entered with ``async with breaker``, per task. Weak keys, so a
+        # task that never exits its block does not stay alive because of it.
+        self._guards: weakref.WeakKeyDictionary[asyncio.Task[object], list[_Guard]] = (
+            weakref.WeakKeyDictionary()
+        )
 
     # -- inspection ----------------------------------------------------------
 
@@ -212,18 +257,29 @@ class CircuitBreaker:
         Raises:
             CircuitOpenError: If the call is rejected.
         """
-        ticket = self._admit()
-        try:
-            result = await func(*args, **kwargs)
-        except BaseException as exc:
-            self._record(ticket, exc)
-            raise
-        self._record(ticket, None)
-        return result
+        async with self.guard():
+            return await func(*args, **kwargs)
+
+    def guard(self) -> AbstractAsyncContextManager[None]:
+        """Return a single-use context manager that protects one call.
+
+        ``async with breaker.guard():`` behaves like ``async with breaker:``
+        but carries its own state, so it also works when the block is exited
+        in a different task from the one that entered it, as happens when an
+        async generator suspended inside the block is closed.
+
+        Raises:
+            CircuitOpenError: On entry, if the call is rejected.
+        """
+        return _Guard(self)
 
     async def __aenter__(self) -> Self:
-        ticket = self._admit()
-        self._tickets.setdefault(asyncio.current_task(), []).append(ticket)
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - only reachable outside a task
+            raise RuntimeError("async with CircuitBreaker must be used inside a task")
+        guard = _Guard(self)
+        await guard.__aenter__()
+        self._guards.setdefault(task, []).append(guard)
         return self
 
     async def __aexit__(
@@ -232,12 +288,22 @@ class CircuitBreaker:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        key = asyncio.current_task()
-        stack = self._tickets[key]
-        ticket = stack.pop()
+        task = asyncio.current_task()
+        stack = self._guards.get(task) if task is not None else None
+        if task is None or not stack:
+            # Entered in another task (e.g. an async generator closed by the
+            # event loop). The outcome cannot be attributed; leave it neutral.
+            # A probe slot left behind is reclaimed after recovery_timeout.
+            logger.warning(
+                "%s: 'async with' exited in a different task than it was entered in; "
+                "use breaker.guard() for code that can do this",
+                self._label(),
+            )
+            return
+        guard = stack.pop()
         if not stack:
-            del self._tickets[key]
-        self._record(ticket, exc)
+            del self._guards[task]
+        await guard.__aexit__(exc_type, exc, tb)
 
     def __repr__(self) -> str:
         label = f" {self._name!r}" if self._name else ""
@@ -257,8 +323,9 @@ class CircuitBreaker:
 
     def _admit(self) -> _Ticket:
         self._refresh()
+        now = self._clock.monotonic()
         if self._state is CircuitState.CLOSED:
-            return _Ticket(self._generation, probe=False)
+            return _Ticket(self._generation, probe=False, admitted_at=now)
         if self._state is CircuitState.OPEN:
             self._rejections += 1
             retry_after = self.retry_after
@@ -267,20 +334,32 @@ class CircuitBreaker:
                 name=self._name,
                 retry_after=retry_after,
             )
-        if self._probes_in_flight >= self._half_open_max_calls:
+        self._expire_lost_probes(now)
+        if len(self._probes) >= self._half_open_max_calls:
             self._rejections += 1
             raise CircuitOpenError(
                 f"{self._label()} is half-open and its probe calls are in flight",
                 name=self._name,
                 retry_after=0.0,
             )
-        self._probes_in_flight += 1
-        return _Ticket(self._generation, probe=True)
+        ticket = _Ticket(self._generation, probe=True, admitted_at=now)
+        self._probes.add(ticket)
+        return ticket
+
+    def _expire_lost_probes(self, now: float) -> None:
+        lost = [t for t in self._probes if now - t.admitted_at > self._recovery_timeout]
+        for ticket in lost:
+            self._probes.discard(ticket)
+            logger.warning(
+                "%s: a probe call did not finish within %gs; admitting another probe",
+                self._label(),
+                self._recovery_timeout,
+            )
 
     def _record(self, ticket: _Ticket, exc: BaseException | None) -> None:
         current = ticket.generation == self._generation
-        if ticket.probe and current:
-            self._probes_in_flight -= 1
+        if ticket.probe:
+            self._probes.discard(ticket)
         if exc is not None and not isinstance(exc, Exception):
             return  # cancellation and other BaseExceptions are neutral
         failed = exc is not None and isinstance(exc, self._failure_exceptions)
@@ -321,7 +400,7 @@ class CircuitBreaker:
                     self._consecutive_failures,
                 )
         elif new is CircuitState.HALF_OPEN:
-            self._probes_in_flight = 0
+            self._probes.clear()
             logger.info("%s is half-open; admitting probe calls", self._label())
         else:
             self._consecutive_failures = 0

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import weakref
+from collections.abc import AsyncIterator
 
 import pytest
 
@@ -335,3 +338,97 @@ async def test_calls_in_flight_during_reset_do_not_affect_state(clock: FakeClock
     with pytest.raises(Unavailable):
         await task
     assert breaker.state is CircuitState.CLOSED
+
+
+# -- calls that leave their task, hang, or time out ---------------------------------
+
+
+async def test_guard_records_the_outcome_when_exited_in_another_task(clock: FakeClock) -> None:
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=1, clock=clock)
+    await trip(breaker, 1)
+    await clock.advance(1)
+
+    async def paginate() -> AsyncIterator[str]:
+        async with breaker.guard():
+            yield "page 1"  # suspended inside the protected block
+
+    pages = paginate()
+    assert await anext(pages) == "page 1"
+    await asyncio.create_task(pages.aclose())  # exits the block in another task
+    # The probe slot was released, so the next call is admitted as a probe.
+    assert await breaker.call(ok) == "ok"
+    assert breaker.state is CircuitState.CLOSED
+
+
+async def test_async_with_exited_in_another_task_neither_raises_nor_jams(
+    clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=1, clock=clock)
+    await trip(breaker, 1)
+    await clock.advance(1)
+
+    async def paginate() -> AsyncIterator[str]:
+        async with breaker:
+            yield "page 1"
+
+    suspended: list[AsyncIterator[str]] = []
+
+    async def enter_in_another_task() -> None:
+        pages = paginate()
+        await anext(pages)
+        suspended.append(pages)
+
+    entering = asyncio.create_task(enter_in_another_task())
+    await entering
+    await asyncio.create_task(suspended[0].aclose())  # no KeyError
+    assert "different task" in caplog.text
+
+    # The lost probe's slot is reclaimed once recovery_timeout has passed...
+    with pytest.raises(CircuitOpenError):
+        await breaker.call(ok)
+    await clock.advance(1.5)
+    assert await breaker.call(ok) == "ok"
+    # ...and the breaker does not keep the entering task alive.
+    task_ref = weakref.ref(entering)
+    del entering
+    gc.collect()
+    assert task_ref() is None
+
+
+async def test_a_hanging_probe_does_not_keep_the_circuit_half_open(clock: FakeClock) -> None:
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=5, clock=clock)
+    await trip(breaker, 1)
+    await clock.advance(5)
+    hung = asyncio.create_task(breaker.call(asyncio.Event().wait))  # a probe with no timeout
+    await asyncio.sleep(0)
+    with pytest.raises(CircuitOpenError):
+        await breaker.call(ok)
+    await clock.advance(5.5)
+    assert await breaker.call(ok) == "ok"  # the hung probe's slot was given away
+    assert breaker.state is CircuitState.CLOSED
+    hung.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await hung
+
+
+async def test_a_guard_can_only_be_used_once(clock: FakeClock) -> None:
+    guard = CircuitBreaker(clock=clock).guard()
+    async with guard:
+        pass
+    with pytest.raises(RuntimeError, match="only be used once"):
+        async with guard:
+            pass
+
+
+async def test_a_timeout_counts_as_a_failure_only_inside_the_breaker() -> None:
+    outside = CircuitBreaker(failure_threshold=2)
+    inside = CircuitBreaker(failure_threshold=2)
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0), outside:  # cancellation reaches the breaker
+                await asyncio.Event().wait()
+        with pytest.raises(TimeoutError):
+            async with inside, asyncio.timeout(0):  # TimeoutError reaches the breaker
+                await asyncio.Event().wait()
+    assert outside.state is CircuitState.CLOSED
+    assert inside.state is CircuitState.OPEN

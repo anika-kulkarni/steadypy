@@ -105,14 +105,14 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Three runnable programs in [`examples/`](examples/) go further. None of them
+Three runnable programs in [`examples/`](https://github.com/anika-kulkarni/steadypy/tree/main/examples) go further. None of them
 needs network access or credentials:
 
 | Example | Shows |
 |---|---|
-| [`resilient_worker.py`](examples/resilient_worker.py) | polling a simulated API with retry, per-attempt timeouts, a rate limit and `bounded_map` |
-| [`supervised_service.py`](examples/supervised_service.py) | producers, consumers and a crash-looping connection under one supervisor |
-| [`graceful_app.py`](examples/graceful_app.py) | supervisor + heartbeats + circuit breaker + signal-driven shutdown with a grace period |
+| [`resilient_worker.py`](https://github.com/anika-kulkarni/steadypy/blob/main/examples/resilient_worker.py) | polling a simulated API with retry, per-attempt timeouts, a rate limit and `bounded_map` |
+| [`supervised_service.py`](https://github.com/anika-kulkarni/steadypy/blob/main/examples/supervised_service.py) | producers, consumers and a crash-looping connection under one supervisor |
+| [`graceful_app.py`](https://github.com/anika-kulkarni/steadypy/blob/main/examples/graceful_app.py) | supervisor + heartbeats + circuit breaker + signal-driven shutdown with a grace period |
 
 ## TaskSupervisor
 
@@ -364,7 +364,7 @@ not be restored.
 **How long can shutdown take?** `supervisor.stop()` cancels every task and
 then waits for each one's cleanup to finish. That is what makes shutdown
 clean, but a task that ignores cancellation will keep the process waiting.
-[`graceful_app.py`](examples/graceful_app.py) shows a grace period, built
+[`graceful_app.py`](https://github.com/anika-kulkarni/steadypy/blob/main/examples/graceful_app.py) shows a grace period, built
 with `asyncio.timeout(None)` and `reschedule()`, that cancels slow workers
 again when it expires. Nothing in-process can force-stop a task that keeps
 ignoring cancellation. The hard limit is your process manager's `SIGKILL`
@@ -479,10 +479,10 @@ mypy src
 ## Contributing
 
 Bug reports, questions and pull requests are welcome. Please read
-[CONTRIBUTING.md](CONTRIBUTING.md) first. In short: behavior changes come with
+[CONTRIBUTING.md](https://github.com/anika-kulkarni/steadypy/blob/main/CONTRIBUTING.md) first. In short: behavior changes come with
 tests, especially around cancellation, and tests use `FakeClock` rather than
 real sleeps. Please report security issues privately as described in
-[SECURITY.md](SECURITY.md).
+[SECURITY.md](https://github.com/anika-kulkarni/steadypy/blob/main/SECURITY.md).
 
 ## Roadmap
 
@@ -517,4 +517,4 @@ libraries are worth a look:
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/anika-kulkarni/steadypy/blob/main/LICENSE)

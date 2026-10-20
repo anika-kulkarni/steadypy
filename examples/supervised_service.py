@@ -87,4 +87,4 @@ async def main(duration: float) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(float(sys.argv[1]) if len(sys.argv) > 1 else 4.0))
+    asyncio.run(main(float(sys.argv[1]) if len(sys.argv) > 1 else 5.0))

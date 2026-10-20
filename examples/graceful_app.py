@@ -10,8 +10,10 @@ It combines:
 * ``HealthRegistry``: each worker heartbeats; a reporter prints the status;
 * ``CircuitBreaker``: protects calls to a dependency that has an outage.
 
-On shutdown the supervisor cancels every worker and waits for their cleanup,
-and the whole shutdown is bounded by a grace period.
+On shutdown the supervisor cancels every worker and waits for their cleanup.
+If cleanup outlasts a grace period, the workers are cancelled again. (A task
+that ignores cancellation altogether can still hold the process up; the hard
+limit is your process manager's SIGKILL.)
 """
 
 from __future__ import annotations
@@ -88,6 +90,7 @@ async def main(run_for: float | None) -> None:
     breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=1, name="dependency")
     dependency = Dependency()
 
+    clean = True
     try:
         # No deadline while running; one is set the moment shutdown begins, so
         # workers that take too long to clean up are cancelled again.
@@ -105,10 +108,13 @@ async def main(run_for: float | None) -> None:
                 loop = asyncio.get_running_loop()
                 shutdown_deadline.reschedule(loop.time() + SHUTDOWN_GRACE_SECONDS)
                 supervisor.stop()
+    except TimeoutError:
+        clean = False
+        print(f"cleanup took longer than {SHUTDOWN_GRACE_SECONDS}s; workers were cancelled again")
     finally:
         shutdown.remove_signal_handlers()
 
-    print("stopped cleanly:")
+    print("stopped cleanly:" if clean else "stopped after the grace period:")
     for name, task in supervisor.tasks.items():
         print(f"  {name:<16} {task.state.value:<10} restarts={task.restarts}")
 

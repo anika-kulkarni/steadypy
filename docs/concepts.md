@@ -54,9 +54,9 @@ Python 3.11 added bookkeeping for cancellation *requests*:
 
 steadypy follows these rules:
 
-1. **`CancelledError` always propagates.** It is never retried, never
-   converted into another exception, never counted as a circuit-breaker
-   failure, and never triggers a supervisor restart.
+1. **Cancellation is never retried or restarted.** A requested cancellation
+   always propagates. It is never retried, never counted as a
+   circuit-breaker failure, and never triggers a supervisor restart.
 2. **A swallowed cancellation still counts.** If code inside a retry attempt
    or a supervised task catches `CancelledError` and raises or returns
    something else, the request is still pending (`cancelling() > 0`).
@@ -66,7 +66,21 @@ steadypy follows these rules:
    exits, it calls `uncancel()` for exactly that request. A cancellation from
    outside, such as an enclosing `asyncio.timeout()`, is left alone and
    propagates.
-4. **Cleanup is awaited, even under repeated cancellation.** If the caller is
+4. **Failures outrank a cancellation.** This follows `TaskGroup`. If
+   supervised tasks failed, the supervisor raises their `ExceptionGroup` even
+   when a cancellation was requested, so an enclosing `asyncio.timeout()` sees
+   the group rather than a `TimeoutError`. On Python 3.13+ the supervisor
+   re-arms the request (`uncancel()` + `cancel()`, as `TaskGroup` does there),
+   so a cancellation nobody else will withdraw still arrives at the next
+   `await`. On 3.11 and 3.12 that is not safe: `uncancel()` there cannot take
+   back a re-armed request, which would hit the next `await` even after a
+   timeout withdrew it. So, like `TaskGroup` on those versions, the request is
+   absorbed into the group.
+5. **An unrequested `CancelledError` is not a cancellation.** A task can end
+   with `CancelledError` although nobody cancelled it, for example by awaiting
+   a future that other code cancelled. For a supervised task with a restart
+   policy, that counts as a failed run and the task is restarted.
+6. **Cleanup is awaited, even under repeated cancellation.** If the caller is
    cancelled again while steadypy is waiting for children to finish their
    cleanup, it keeps waiting and re-raises the cancellation afterwards, as
    `TaskGroup` does.
@@ -96,7 +110,8 @@ supervisor is stopping.
 not unlucky. `max_restarts` limits how many restarts are allowed and
 `restart_window` turns that into a rate ("5 restarts per 60 seconds"),
 similar to OTP's *intensity* and *period*. Once the limit is hit, the next
-exit is final.
+exit is final. Without a window the limit counts every restart in the task's
+lifetime, which suits batch jobs better than services.
 
 **Backoff.** Restarts wait `restart_delay`, doubling each time up to
 `max_restart_delay`. With a window, the backoff exponent counts only recent
@@ -112,6 +127,13 @@ raised together as an
 when the block exits, each annotated with the failing task's name (see
 [PEP 654](https://peps.python.org/pep-0654/) for `except*`).
 
+**Memory.** A supervisor keeps a handle for each task it started, so final
+states can be inspected after the block. Finished tasks release their
+callable and arguments, but the handles themselves accumulate. For an
+unbounded stream of short-lived tasks (one per connection), use
+`retain_finished=False`, and catch expected errors inside the task, since
+failures are kept until the block exits.
+
 **Why restartable tasks are callables.** A coroutine object can only be
 awaited once. To run a task again, steadypy must create a new coroutine,
 which means calling a function. `start(worker(), restart=True)` is therefore
@@ -126,6 +148,9 @@ Both re-run something that failed, but at different levels:
 | Re-runs | one operation (a request, a query) | a whole long-running task (a consumer loop, a connection) |
 | Typical delays | milliseconds to seconds | seconds to tens of seconds |
 | On exhaustion | raises to the caller, who decides what to do | the task fails for good; the failure policy applies |
+
+Note that `retry` retries every `Exception` unless you pass `retry_on`:
+programming errors included. Narrow it to the transient errors you expect.
 
 They compose. Retry individual operations inside a worker, and let the
 supervisor restart the worker if something escapes. Be careful when stacking
@@ -158,10 +183,28 @@ How a call's outcome is counted:
 | raises any other `Exception` | success | the dependency responded; your exception still propagates |
 | is cancelled | neither | no counters change; a probe slot is released |
 
+Because cancellation is neutral, a timeout must sit *inside* the protected
+block to count. With `async with breaker: async with asyncio.timeout(5): ...`,
+a hanging dependency raises `TimeoutError`, which counts as a failure. With
+the timeout outside, the breaker only sees a cancellation, and a dependency
+that always hangs never trips it.
+
 While open, calls are rejected with `CircuitOpenError` without running.
 `exc.retry_after` gives the seconds until a probe is admitted. While
 half-open, at most `half_open_max_calls` probes run at once; other callers
-are rejected with `retry_after == 0`.
+are rejected with `retry_after == 0`. A probe slot is a lease: a probe that
+has not reported back within `recovery_timeout` is considered lost, and its
+slot goes to the next caller. A single hung probe therefore cannot keep the
+circuit half-open forever.
+
+**Entering and exiting in different tasks.** `async with breaker:` tracks
+calls per task, so it must be exited in the task that entered it. An async
+generator suspended inside the block breaks that when it is closed from
+another task, for example by the event loop's cleanup. For such code use
+`async with breaker.guard():`, a single-use context manager that carries its
+own state. (If `async with breaker:` is exited in another task anyway, the
+outcome is treated as neutral and logged, and any probe slot it held is
+reclaimed by the lease.)
 
 **Generations.** Every state transition increments a generation counter, and
 each admitted call remembers the generation it was admitted in. Only results
@@ -171,8 +214,9 @@ already opened, the open period is not extended ten times. A success from a
 call admitted before the circuit opened cannot close it. Calls in flight
 during `reset()` do not undo the reset.
 
-**With retry.** Put the breaker *inside* the retried operation and leave
-`CircuitOpenError` out of `retry_on`. Rejected calls then fail fast instead
+**With retry.** Put the breaker *inside* the retried operation, and make sure
+`retry_on` does not include `CircuitOpenError`. The default,
+`retry_on=Exception`, does include it. Rejected calls then fail fast instead
 of being retried against an open circuit.
 
 ## Rate limiting
@@ -182,6 +226,13 @@ The bucket holds up to `burst` tokens (default: `rate`, at least 1) and refills
 continuously at `rate / per` tokens per second. Each `acquire(n)` takes `n`
 tokens, waiting for them if needed. The bucket starts full, so a service may
 burst immediately and is then held to the average rate.
+
+The precise guarantee: in any window of *W* seconds, at most
+`burst + rate / per × W` tokens are taken. `RateLimiter(rate=5)` therefore
+admits up to 10 calls in the first second after an idle period, and 5 per
+second after that. If the API you call enforces "at most *N* in any one
+second" strictly, set `burst=1`, so calls are evenly spaced, and leave
+yourself some margin.
 
 - Waiters are served in arrival order, so a request for many tokens is not
   starved by a stream of small requests.
@@ -202,8 +253,13 @@ calls `health.heartbeat(name)` each time it completes a unit of work, so a
 component that is running but stuck (blocked on a dead connection, say)
 stops sending heartbeats and becomes unhealthy after its `timeout`.
 
-- **Readiness.** Components are unhealthy until their first heartbeat, so a
-  freshly started service is not reported ready before it has done anything.
+- **Readiness vs liveness.** Components are unhealthy until their first
+  heartbeat, so a freshly started service is not reported *ready* before it
+  has done anything. A *liveness* check, one that restarts the process when
+  it fails, should not use that same signal during startup. Give it a grace
+  period, or only start acting on it after the first healthy report.
+  Otherwise a slow start leads to a restart loop.
+- **No critical components** means overall health is `True`.
 - **Critical vs non-critical.** Overall health considers only critical
   components. An unhealthy non-critical component (an optional cache) makes
   the report `degraded` instead.
@@ -220,21 +276,35 @@ A typical shutdown sequence:
 2. `ShutdownSignal` is triggered and records the reason; every `wait()` returns.
 3. The service calls `supervisor.stop()`. The supervisor cancels its tasks and
    waits for their cleanup.
-4. An outer `asyncio.timeout()`, armed with `reschedule()` when shutdown
-   began, bounds how long cleanup may take (see `examples/graceful_app.py`).
+4. Optionally, a grace period: an outer `asyncio.timeout()`, armed with
+   `reschedule()` when shutdown began (see `examples/graceful_app.py`). When
+   it expires, the supervisor cancels its tasks *again*, which interrupts
+   cleanup code that is awaiting something, and the block raises
+   `TimeoutError`.
+
+What no in-process mechanism can do is force-stop a task that keeps catching
+and ignoring `CancelledError`. The supervisor will wait for it, because
+abandoning it would break structured concurrency. The real upper bound on
+shutdown time is the process manager's `SIGKILL` after its own grace period
+(for example, Kubernetes' `terminationGracePeriodSeconds`).
 
 Signal handlers are installed with
 [`loop.add_signal_handler`](https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.add_signal_handler)
 on event loops that support it (Unix). Other loops fall back to
 `signal.signal`, with a handler that hands the work to the loop via
 `call_soon_threadsafe`. `remove_signal_handlers()` restores whatever handler
-was installed before.
+was set before with `signal.signal`. An event loop keeps handlers registered
+with `loop.add_signal_handler()` to itself, so they could not be restored.
+Installing over one, whether the application's own or another
+`ShutdownSignal`'s, is therefore refused with a `RuntimeError`.
 
 **Second Ctrl-C.** While steadypy's handlers are installed, further signals
-are ignored: shutdown is already under way. To let a second Ctrl-C interrupt
-a slow shutdown, call `shutdown.remove_signal_handlers()` as soon as
-`wait()` returns. The previous handler (for example, the one `asyncio.run()`
-installs, which cancels the main task) is then back in place.
+are ignored: shutdown is already under way. Call
+`shutdown.remove_signal_handlers()` as soon as `wait()` returns to restore
+the previous handler. Under `asyncio.run()` the next Ctrl-C then cancels the
+main task, which makes a supervisor cancel its tasks again; that ends cleanup
+code that is merely slow. A further Ctrl-C raises `KeyboardInterrupt`, which
+is `asyncio.run()`'s usual behavior.
 
 ## Time and testing
 

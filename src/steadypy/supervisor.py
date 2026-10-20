@@ -127,7 +127,7 @@ class SupervisedTask(Generic[T]):
         max_restart_delay: float,
     ) -> None:
         self._name = name
-        self._factory = factory
+        self._factory: Callable[[], Awaitable[T]] | None = factory
         self._restart = restart
         self._max_restarts = max_restarts
         self._restart_window = restart_window
@@ -151,6 +151,7 @@ class SupervisedTask(Generic[T]):
     @property
     def state(self) -> TaskState:
         """The current :class:`TaskState`."""
+        self._sync()
         return self._state
 
     @property
@@ -175,6 +176,7 @@ class SupervisedTask(Generic[T]):
 
     def done(self) -> bool:
         """Return ``True`` once the task has completed, failed or been cancelled."""
+        self._sync()
         return self._state in _FINAL_STATES
 
     def result(self) -> T:
@@ -184,6 +186,7 @@ class SupervisedTask(Generic[T]):
         if it was cancelled, and :class:`asyncio.InvalidStateError` if it is
         still running or restarting.
         """
+        self._sync()
         if self._state is TaskState.COMPLETED:
             return cast(T, self._result)
         if self._state is TaskState.FAILED:
@@ -199,6 +202,7 @@ class SupervisedTask(Generic[T]):
         Raises like :meth:`asyncio.Task.exception` when the task was cancelled
         or is not done yet.
         """
+        self._sync()
         if self._state is TaskState.CANCELLED:
             raise asyncio.CancelledError(f"supervised task {self._name!r} was cancelled")
         if not self.done():
@@ -250,10 +254,28 @@ class SupervisedTask(Generic[T]):
         self._state = state
         self._result = result
         self._exception = exception
+        self._release()
+
+    def _release(self) -> None:
+        """Drop the callable and its arguments; the task will not run again."""
+        factory, self._factory = self._factory, None
+        if isinstance(factory, _OneShot):
+            # A task cancelled before its first step never awaited the coroutine
+            # it was given; close it so it is not reported as never awaited.
+            factory.discard()
+
+    def _sync(self) -> None:
+        # A task cancelled before its first step finishes one event-loop
+        # iteration before the supervisor's done callback records it. Report
+        # it as cancelled in the meantime instead of as still running.
+        task = self._task
+        if self._state not in _FINAL_STATES and task is not None and task.cancelled():
+            self._state = TaskState.CANCELLED
+            self._release()
 
     def __repr__(self) -> str:
         return (
-            f"<SupervisedTask {self._name!r} state={self._state.value} "
+            f"<SupervisedTask {self._name!r} state={self.state.value} "
             f"restarts={self._restarts} failures={self._failures}>"
         )
 
@@ -287,12 +309,35 @@ class TaskSupervisor:
         fail-fast mode is withdrawn with :meth:`asyncio.Task.uncancel` and
         never escapes, so it is safe to use inside :func:`asyncio.timeout`.
 
+        As with :class:`asyncio.TaskGroup`, failures take priority: if tasks
+        failed, the ``ExceptionGroup`` is raised instead of ``CancelledError``.
+        The cancellation request is kept pending (as Python 3.13's
+        ``TaskGroup`` does), so it is delivered at the next ``await``.
+
+        A task that ends with a ``CancelledError`` although nobody cancelled
+        it (it awaited a future that something else cancelled) counts as a
+        failed run when it has a restart policy, so it is restarted instead of
+        stopping silently.
+
+    ``KeyboardInterrupt`` and ``SystemExit``, whether raised by a task or by
+    the body, always stop the supervisor and are re-raised on their own,
+    never wrapped in a group.
+
+    Memory:
+        By default :attr:`tasks` keeps a handle for every task started,
+        finished ones included, so their final state can be inspected. For an
+        unbounded stream of short-lived tasks (one per connection or message)
+        pass ``retain_finished=False`` so that finished tasks are dropped.
+        Failures are still collected in :attr:`errors` until the block exits,
+        so handle expected exceptions inside such tasks.
+
     Args:
         fail_fast: Whether one task failing for good cancels everything else.
         restart_delay: Default delay before a task's first restart. Each
             further restart doubles it.
         max_restart_delay: Upper bound for the restart delay. Defaults to 30
             seconds, or to ``restart_delay`` if that is larger.
+        retain_finished: Whether :attr:`tasks` keeps finished tasks.
         name: Optional name for log messages and ``repr``.
         clock: Time source for restart backoff; see :mod:`steadypy.testing`.
     """
@@ -303,6 +348,7 @@ class TaskSupervisor:
         fail_fast: bool = True,
         restart_delay: float = 0.5,
         max_restart_delay: float | None = None,
+        retain_finished: bool = True,
         name: str | None = None,
         clock: Clock | None = None,
     ) -> None:
@@ -310,6 +356,7 @@ class TaskSupervisor:
             max_restart_delay = max(_DEFAULT_MAX_RESTART_DELAY, restart_delay)
         _check_delays(restart_delay, max_restart_delay)
         self._fail_fast = fail_fast
+        self._retain_finished = retain_finished
         self._restart_delay = restart_delay
         self._max_restart_delay = max_restart_delay
         self._name = name
@@ -348,6 +395,8 @@ class TaskSupervisor:
         assert parent is not None
         self._exiting = True
         propagate_cancel = exc if isinstance(exc, asyncio.CancelledError) else None
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)) and self._base_error is None:
+            self._base_error = exc
         if exc is not None:
             self._abort()
 
@@ -372,16 +421,23 @@ class TaskSupervisor:
             # to interrupt the body after a failure. It must not escape.
             propagate_cancel = None
 
+        if self._base_error is None and not self._errors:
+            if propagate_cancel is not None:
+                raise propagate_cancel
+            return  # any other exception from the body propagates unchanged
+
+        if parent.cancelling():
+            # Failures take priority over a pending cancellation, but the
+            # cancellation must not be lost: re-arm it so that it is delivered
+            # at the parent's next await (what TaskGroup does since 3.13).
+            parent.uncancel()
+            parent.cancel()
         if self._base_error is not None:
             raise self._base_error
-        if self._errors:
-            errors = list(self._errors)
-            if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                errors.insert(0, exc)
-            raise BaseExceptionGroup("unhandled errors in TaskSupervisor", errors)
-        if propagate_cancel is not None:
-            raise propagate_cancel
-        # Any other exception from the body propagates unchanged.
+        errors = list(self._errors)
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            errors.insert(0, exc)
+        raise BaseExceptionGroup("unhandled errors in TaskSupervisor", errors)
 
     # -- starting and stopping tasks ---------------------------------------
 
@@ -541,7 +597,11 @@ class TaskSupervisor:
 
     @property
     def tasks(self) -> Mapping[str, SupervisedTask[Any]]:
-        """A read-only snapshot of the tasks started so far, keyed by name."""
+        """A read-only snapshot of the supervisor's tasks, keyed by name.
+
+        Includes finished tasks unless the supervisor was created with
+        ``retain_finished=False``.
+        """
         return MappingProxyType(dict(self._tasks))
 
     @property
@@ -597,19 +657,28 @@ class TaskSupervisor:
         while True:
             handle._state = TaskState.RUNNING
             result: Any = None
-            failure: Exception | None = None
+            failure: BaseException | None = None
+            factory = handle._factory
+            assert factory is not None
             try:
-                awaitable = handle._factory()
+                awaitable = factory()
                 if not inspect.isawaitable(awaitable):
                     raise TypeError(
                         f"target of supervised task {handle.name!r} returned "
                         f"{type(awaitable).__name__}, not an awaitable"
                     )
                 result = await awaitable
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError as exc:
+                if handle._restart == "never" or self._cancellation_requested(handle, task):
+                    raise
+                # Nobody asked this task to stop: something it awaited was
+                # cancelled elsewhere. Let the restart policy handle it rather
+                # than letting the task end silently.
+                failure = exc
             except Exception as exc:
                 failure = exc
+            except GeneratorExit:
+                raise  # the coroutine is being closed; not a failure
             except BaseException as exc:
                 # KeyboardInterrupt, SystemExit and the like are never restarted.
                 handle._failures += 1
@@ -633,29 +702,42 @@ class TaskSupervisor:
                 self._finish_run(handle, result, failure)
                 return
             handle._state = TaskState.RESTARTING
+            if isinstance(failure, asyncio.CancelledError):
+                outcome = "was stopped by a CancelledError that nobody requested"
+            elif failure is not None:
+                outcome = f"failed with {failure!r}"
+            else:
+                outcome = "returned"
             logger.warning(
                 "supervised task %r %s; restarting in %.3gs (restart #%d)",
                 handle.name,
-                f"failed with {failure!r}" if failure is not None else "returned",
+                outcome,
                 delay,
                 handle._restarts + 1,
             )
             await self._clock.sleep(delay)
             handle._restarts += 1
 
+    def _cancellation_requested(
+        self, handle: SupervisedTask[Any], task: asyncio.Task[None]
+    ) -> bool:
+        return self._stopping or handle._cancel_requested or task.cancelling() > 0
+
     def _wants_restart(
         self, handle: SupervisedTask[Any], task: asyncio.Task[None], *, failed: bool
     ) -> bool:
-        if handle._restart == "never" or self._stopping or handle._cancel_requested:
-            return False
-        if task.cancelling():
-            # Cancellation was requested but the task swallowed it. Honour the
-            # request rather than starting the task again.
+        if handle._restart == "never" or self._cancellation_requested(handle, task):
+            # This also covers a cancellation request that the task swallowed:
+            # honour the request rather than starting the task again.
             return False
         return failed or handle._restart == "always"
 
     @staticmethod
-    def _finish_run(handle: SupervisedTask[Any], result: Any, failure: Exception | None) -> None:
+    def _finish_run(
+        handle: SupervisedTask[Any], result: Any, failure: BaseException | None
+    ) -> None:
+        if isinstance(failure, asyncio.CancelledError):
+            raise failure  # out of restarts after stray cancellations: end as cancelled
         if failure is not None:
             handle._finish(TaskState.FAILED, exception=failure)
         else:
@@ -663,17 +745,16 @@ class TaskSupervisor:
 
     def _on_task_done(self, handle: SupervisedTask[Any], task: asyncio.Task[None]) -> None:
         self._active.discard(task)
-        if isinstance(handle._factory, _OneShot):
-            # A task cancelled before its first step never awaited the
-            # coroutine it was given; close it so it is not reported as leaked.
-            handle._factory.discard()
         if task.cancelled():
             # Also covers a task cancelled before its coroutine ever started.
             handle._state = TaskState.CANCELLED
         elif (exc := task.exception()) is not None:  # pragma: no cover - defensive
             handle._finish(TaskState.FAILED, exception=exc)
+        handle._release()
         if handle._state is TaskState.FAILED:
             self._record_failure(handle)
+        if not self._retain_finished and self._tasks.get(handle.name) is handle:
+            del self._tasks[handle.name]
         waiter = self._done_waiter
         if waiter is not None and not self._active and not waiter.done():
             waiter.set_result(None)

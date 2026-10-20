@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import weakref
 from itertools import pairwise
 
 import pytest
 
-from steadypy import TaskState, TaskSupervisor
+from steadypy import SupervisedTask, TaskState, TaskSupervisor
 from steadypy.testing import FakeClock
 
 
@@ -579,16 +581,52 @@ async def test_swallowed_cancellation_is_never_restarted() -> None:
     assert handle.state is TaskState.COMPLETED
 
 
-async def test_a_child_raising_cancelled_error_itself_is_not_an_error() -> None:
-    async def gives_up() -> None:
-        await asyncio.sleep(0)
-        raise asyncio.CancelledError
+async def stray_cancellation() -> None:
+    """Await a future that something else cancelled; nobody cancelled us."""
+    future = asyncio.get_running_loop().create_future()
+    future.cancel()
+    await future
 
+
+async def test_stray_cancelled_error_without_restart_policy_ends_as_cancelled() -> None:
     async with TaskSupervisor() as supervisor:
-        handle = supervisor.start(gives_up, restart=True)
+        handle = supervisor.start(stray_cancellation)
         other = supervisor.start(returns, 1)
     assert handle.state is TaskState.CANCELLED
     assert other.result() == 1
+    assert supervisor.errors == ()
+
+
+async def test_stray_cancelled_error_restarts_a_task_with_a_restart_policy(
+    clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    runs = 0
+
+    async def worker() -> str:
+        nonlocal runs
+        runs += 1
+        if runs < 3:
+            await stray_cancellation()
+        return "recovered"
+
+    caplog.set_level(logging.WARNING, logger="steadypy.supervisor")
+    async with TaskSupervisor(clock=clock, restart_delay=1) as supervisor:
+        handle = supervisor.start(worker, restart=True)
+        await clock.advance(10)
+    assert handle.result() == "recovered"
+    assert handle.restarts == 2
+    assert isinstance(handle.last_exception, asyncio.CancelledError)
+    assert "CancelledError that nobody requested" in caplog.text
+
+
+async def test_stray_cancellations_that_exhaust_restarts_end_as_cancelled(
+    clock: FakeClock,
+) -> None:
+    async with TaskSupervisor(clock=clock, restart_delay=1) as supervisor:
+        handle = supervisor.start(stray_cancellation, restart=True, max_restarts=2)
+        await clock.advance(10)
+    assert handle.state is TaskState.CANCELLED
+    assert handle.restarts == 2
     assert supervisor.errors == ()
 
 
@@ -713,3 +751,116 @@ async def test_max_restart_delay_defaults_to_at_least_the_restart_delay(clock: F
             await clock.advance(1_000)
     assert starts["a"] == [0, 60, 120]  # capped at 60, not doubled to 120
     assert starts["b"] == [0, 100]
+
+
+# -- review fixes: lost cancellations, base errors, memory ------------------------
+
+
+async def test_external_cancellation_survives_failures_raised_at_exit() -> None:
+    entered = asyncio.Event()
+    after_group: list[str] = []
+
+    async def fails_during_cleanup() -> None:
+        try:
+            await forever()
+        finally:
+            raise Boom("cleanup failed")  # an error raised while being cancelled
+
+    async def service() -> None:
+        try:
+            async with TaskSupervisor(fail_fast=False) as supervisor:
+                supervisor.start(fails_during_cleanup)
+                entered.set()
+                await forever()
+        except* Boom:
+            after_group.append("handled the group")
+        await asyncio.sleep(0)  # the pending cancellation must be delivered here
+        after_group.append("unreachable")  # pragma: no cover
+
+    task = asyncio.create_task(service())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert after_group == ["handled the group"]
+
+
+async def test_base_exception_from_the_body_is_never_wrapped() -> None:
+    with pytest.raises(SystemExit) as info:
+        async with TaskSupervisor(fail_fast=False) as supervisor:
+            handle = supervisor.start(fails)
+            await handle.wait()
+            raise SystemExit(2)
+    assert info.value.code == 2
+
+
+async def test_state_is_cancelled_as_soon_as_a_task_cancelled_before_starting_is_done() -> None:
+    async with TaskSupervisor() as supervisor:
+        handle = supervisor.start(forever)
+        supervisor.stop()  # cancelled before its first step
+        await asyncio.sleep(0)  # the task is done; its done callback has not run yet
+        await handle.wait()
+        assert handle.done()
+        assert handle.state is TaskState.CANCELLED
+        with pytest.raises(asyncio.CancelledError):
+            handle.result()
+
+
+def test_closing_an_abandoned_task_is_not_recorded_as_a_failure() -> None:
+    loop = asyncio.new_event_loop()
+    holder: list[object] = []
+
+    async def start_and_abandon() -> None:
+        supervisor = TaskSupervisor()
+        await supervisor.__aenter__()
+        handle = supervisor.start(forever)
+        await asyncio.sleep(0)
+        holder.append(handle)
+
+    try:
+        loop.run_until_complete(start_and_abandon())
+        handle = holder[0]
+        assert isinstance(handle, SupervisedTask)
+        task = handle._task
+        assert task is not None
+        task.get_coro().close()  # what happens to a pending task when its loop is discarded
+        assert handle.state is not TaskState.FAILED
+        assert handle.failures == 0
+    finally:
+        loop.close()
+
+
+async def test_finished_tasks_release_their_arguments() -> None:
+    class Connection:
+        pass
+
+    connection = Connection()
+    ref = weakref.ref(connection)
+
+    async def handle_connection(conn: Connection) -> None:
+        await asyncio.sleep(0)
+
+    async with TaskSupervisor() as supervisor:
+        handle = supervisor.start(handle_connection, connection)
+        del connection
+    gc.collect()
+    assert handle.state is TaskState.COMPLETED
+    assert ref() is None
+
+
+async def test_retain_finished_false_keeps_only_live_tasks() -> None:
+    with pytest.raises(ExceptionGroup) as info:
+        async with TaskSupervisor(retain_finished=False, fail_fast=False) as supervisor:
+            supervisor.start(forever, name="listener")
+            handles = [supervisor.start(returns, n, name=f"conn-{n}") for n in range(50)]
+            failing = supervisor.start(fails, "conn reset", name="conn-bad")
+            for h in [*handles, failing]:
+                await h.wait()
+            await asyncio.sleep(0)
+            assert set(supervisor.tasks) == {"listener"}
+            assert len(supervisor.errors) == 1  # failures are still collected...
+            again = supervisor.start(returns, 1, name="conn-0")  # ...and names are free again
+            await again.wait()
+            supervisor.stop()
+    assert info.group_contains(Boom, match="conn reset")  # ...and raised at exit
+    assert dict(supervisor.tasks) == {}
